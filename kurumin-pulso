@@ -738,6 +738,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sem-html", action="store_true", help="não gera o relatório HTML")
     ap.add_argument("--version", action="version", version=f"kurumin-pulso {VERSAO}")
     a = ap.parse_args(argv)
+    # no Debian, o iw fica em /usr/sbin, fora do PATH de usuário comum
+    os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
 
     cor = Cor(sys.stdout.isatty() and not a.json and os.environ.get("NO_COLOR") is None)
     log = (lambda m: None) if a.json else (lambda m: print(cor("2", f"  · {m}"), flush=True))
