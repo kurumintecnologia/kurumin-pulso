@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Kurumin Pulso: teste de rede em um comando, com relatório e histórico.
+# Copyright (C) 2026 Tácio Souza de Oliveira / Kurumin Tecnologia
+#
+# Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo
+# sob os termos da GNU General Public License, versão 3 ou posterior.
+# Ele é distribuído na esperança de ser útil, mas SEM NENHUMA GARANTIA.
+# Veja o arquivo LICENSE ou <https://www.gnu.org/licenses/>.
+"""Kurumin Pulso: mede a saúde da sua conexão e guarda o histórico.
+
+Uso rápido:
+    kurumin-pulso                      # teste completo + relatório HTML
+    kurumin-pulso --rotulo cabo        # marca o teste (ex.: cabo, wifi, 4g)
+    kurumin-pulso --contratado 300/150 # compara com o plano (Mbit/s down/up)
+    kurumin-pulso --rapido             # só latência, perda e DNS (sem velocidade)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSAO = "0.1.0"
+REPO = "https://github.com/kurumintecnologia/kurumin-pulso"
+UA = f"KuruminPulso/{VERSAO} (+{REPO})"
+URL_DOWN = "https://speed.cloudflare.com/__down?bytes={n}"
+URL_UP = "https://speed.cloudflare.com/__up"
+ALVOS_INTERNET = [("Cloudflare", "1.1.1.1"), ("Google", "8.8.8.8")]
+DOMINIOS_DNS = ["gov.br", "kurumintecnologia.com.br", "wikipedia.org", "github.com"]
+
+
+# --------------------------------------------------------------------------
+# utilidades
+# --------------------------------------------------------------------------
+
+def executar(cmd: list[str], timeout: float = 30) -> str:
+    """Roda um comando e devolve a saída (vazia se falhar). Força saída em inglês
+    para o parse não depender do idioma do sistema."""
+    if not shutil.which(cmd[0]):
+        return ""
+    env = dict(os.environ, LC_ALL="C", LANG="C")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.stdout + r.stderr
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def ler(caminho: str) -> str | None:
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def pasta_dados() -> str:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    p = os.path.join(base, "kurumin-pulso")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def arred(v, casas=1):
+    return None if v is None else round(v, casas)
+
+
+# --------------------------------------------------------------------------
+# medições
+# --------------------------------------------------------------------------
+
+def conexao(detalhes: bool) -> dict:
+    """Descobre por onde o computador sai para a internet (cabo, Wi-Fi, USB)."""
+    info: dict = {"interface": None, "tipo": "desconhecido"}
+    rota = executar(["ip", "route", "show", "default"])
+    m = re.search(r"default via (\S+) dev (\S+)", rota)
+    if not m:
+        return info
+    gw, dev = m.group(1), m.group(2)
+    info["interface"] = dev
+    info["_gateway"] = gw  # usado no teste; só vai para o relatório com --detalhes
+    if detalhes:
+        info["gateway"] = gw
+
+    if os.path.isdir(f"/sys/class/net/{dev}/wireless") or dev.startswith("wl"):
+        info["tipo"] = "wifi"
+        saida = executar(["iw", "dev", dev, "link"])
+        if (f := re.search(r"freq:\s*([\d.]+)", saida)):
+            mhz = float(f.group(1))
+            info["wifi_freq_mhz"] = mhz
+            info["wifi_banda"] = "6 GHz" if mhz >= 5925 else ("5 GHz" if mhz >= 4900 else "2,4 GHz")
+        if (s := re.search(r"signal:\s*(-?\d+)", saida)):
+            info["wifi_sinal_dbm"] = int(s.group(1))
+        if (b := re.search(r"tx bitrate:\s*([\d.]+)", saida)):
+            info["wifi_taxa_mbps"] = float(b.group(1))
+        if "wifi_sinal_dbm" not in info:  # sem o iw: tenta o /proc
+            for linha in (ler("/proc/net/wireless") or "").splitlines():
+                if linha.strip().startswith(dev + ":"):
+                    partes = linha.split()
+                    try:
+                        info["wifi_sinal_dbm"] = int(float(partes[3]))
+                    except (IndexError, ValueError):
+                        pass
+    elif dev.startswith(("usb", "rndis", "enx")) and os.path.exists(f"/sys/class/net/{dev}/device"):
+        info["tipo"] = "usb"
+    else:
+        info["tipo"] = "cabo"
+        vel = ler(f"/sys/class/net/{dev}/speed")
+        dup = ler(f"/sys/class/net/{dev}/duplex")
+        if vel and vel.lstrip("-").isdigit() and int(vel) > 0:
+            info["cabo_link_mbps"] = int(vel)
+        if dup:
+            info["cabo_duplex"] = dup
+    return info
+
+
+def _resumo_amostras(amostras: list[float], enviados: int, recebidos: int, metodo: str) -> dict:
+    r = {
+        "metodo": metodo,
+        "enviados": enviados,
+        "recebidos": recebidos,
+        "perda_pct": arred(100 * (enviados - recebidos) / enviados if enviados else 100.0),
+        "amostras": [round(a, 2) for a in amostras],
+    }
+    if amostras:
+        r["min"] = arred(min(amostras), 2)
+        r["media"] = arred(statistics.fmean(amostras), 2)
+        r["max"] = arred(max(amostras), 2)
+        r["desvio"] = arred(statistics.pstdev(amostras), 2)  # equivale ao "mdev" do ping
+        difs = [abs(b - a) for a, b in zip(amostras, amostras[1:])]
+        r["jitter"] = arred(statistics.fmean(difs), 2) if difs else 0.0
+    return r
+
+
+def medir_latencia(host: str, n: int, porta_tcp: int = 443) -> dict:
+    """Usa o ping (ICMP). Sem ping disponível, mede o tempo de conexão TCP."""
+    if shutil.which("ping"):
+        saida = executar(["ping", "-n", "-c", str(n), "-i", "0.2", "-W", "2", host], timeout=n * 0.3 + 15)
+        if (m := re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", saida)):
+            amostras = [float(x) for x in re.findall(r"time[=<]([\d.]+)", saida)]
+            return _resumo_amostras(amostras, int(m.group(1)), int(m.group(2)), "icmp")
+    amostras = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        try:
+            with socket.create_connection((host, porta_tcp), timeout=2):
+                amostras.append((time.perf_counter() - t0) * 1000)
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return _resumo_amostras(amostras, n, len(amostras), f"tcp:{porta_tcp}")
+
+
+def medir_dns() -> dict:
+    tempos = {}
+    for d in DOMINIOS_DNS:
+        t0 = time.perf_counter()
+        try:
+            socket.getaddrinfo(d, 443)
+            tempos[d] = round((time.perf_counter() - t0) * 1000, 1)
+        except OSError:
+            tempos[d] = None
+    ok = [v for v in tempos.values() if v is not None]
+    return {"tempos_ms": tempos, "media_ms": arred(statistics.fmean(ok)) if ok else None, "falhas": len(tempos) - len(ok)}
+
+
+def _http(req: urllib.request.Request, timeout: float):
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def medir_download(mb: int) -> dict:
+    n = mb * 1_000_000
+    try:  # aquecimento curto (abre a conexão, não entra na conta)
+        with _http(urllib.request.Request(URL_DOWN.format(n=100_000), headers={"User-Agent": UA}), 15) as r:
+            r.read()
+    except (urllib.error.URLError, OSError):
+        pass
+    req = urllib.request.Request(URL_DOWN.format(n=n), headers={"User-Agent": UA})
+    try:
+        t0 = time.perf_counter()
+        total = 0
+        with _http(req, 60) as r:
+            while (bloco := r.read(256 * 1024)):
+                total += len(bloco)
+        seg = time.perf_counter() - t0
+    except (urllib.error.URLError, OSError) as e:
+        return {"erro": str(getattr(e, "reason", e))[:120]}
+    if total < n * 0.9:
+        return {"erro": f"resposta incompleta ({total} de {n} bytes)"}
+    return {"mbps": round(total * 8 / seg / 1e6, 1), "bytes": total, "segundos": round(seg, 2)}
+
+
+def medir_upload(mb: int) -> dict:
+    dados = os.urandom(mb * 1_000_000)
+    req = urllib.request.Request(URL_UP, data=dados, method="POST",
+                                 headers={"User-Agent": UA, "Content-Type": "application/octet-stream"})
+    try:
+        t0 = time.perf_counter()
+        with _http(req, 90) as r:
+            r.read()
+        seg = time.perf_counter() - t0
+    except (urllib.error.URLError, OSError) as e:
+        return {"erro": str(getattr(e, "reason", e))[:120]}
+    return {"mbps": round(len(dados) * 8 / seg / 1e6, 1), "bytes": len(dados), "segundos": round(seg, 2)}
+
+
+def medir_site(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    t0 = time.perf_counter()
+    try:
+        with _http(req, 20) as r:
+            r.read(1)
+            ttfb = time.perf_counter() - t0
+            r.read()
+            return {"url": url, "status": r.status, "primeiro_byte_ms": round(ttfb * 1000),
+                    "total_ms": round((time.perf_counter() - t0) * 1000)}
+    except urllib.error.HTTPError as e:
+        return {"url": url, "status": e.code, "total_ms": round((time.perf_counter() - t0) * 1000)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"url": url, "erro": str(getattr(e, "reason", e))[:120]}
+
+
+# --------------------------------------------------------------------------
+# diagnóstico
+# --------------------------------------------------------------------------
+
+def resumo(r: dict) -> dict:
+    """Números-chave de um teste, usados no histórico e nas comparações."""
+    inet = [p for p in r["latencia"]["internet"] if p.get("media") is not None]
+    todos = r["latencia"]["internet"]
+    return {
+        "quando": r["quando"],
+        "rotulo": r.get("rotulo"),
+        "tipo": r["conexao"].get("tipo"),
+        "latencia_ms": arred(statistics.fmean(p["media"] for p in inet), 1) if inet else None,
+        "jitter_ms": arred(statistics.fmean(p["jitter"] for p in inet), 1) if inet else None,
+        "perda_pct": arred(statistics.fmean(p["perda_pct"] for p in todos), 1) if todos else None,
+        "dns_ms": r["dns"].get("media_ms"),
+        "download_mbps": (r.get("download") or {}).get("mbps"),
+        "upload_mbps": (r.get("upload") or {}).get("mbps"),
+        "wifi_sinal_dbm": r["conexao"].get("wifi_sinal_dbm"),
+    }
+
+
+def diagnosticar(r: dict, contratado: tuple[float, float] | None) -> list[dict]:
+    d = []
+
+    def add(nivel, titulo, texto):
+        d.append({"nivel": nivel, "titulo": titulo, "texto": texto})
+
+    s = resumo(r)
+    gw = r["latencia"].get("gateway") or {}
+    perda_gw = gw.get("perda_pct")
+    perda = s["perda_pct"]
+
+    if perda is None:
+        add("critico", "Sem resposta da internet", "Nenhum destino respondeu. Verifique cabo, Wi-Fi e roteador.")
+    elif perda > 0:
+        if perda_gw and perda_gw > 0:
+            add("critico" if perda >= 2 else "alerta", f"Perda de pacotes: {_fmt(perda)}%",
+                f"A perda já começa dentro de casa (roteador: {_fmt(perda_gw)}%). Suspeite do cabo, da porta ou do Wi-Fi.")
+        else:
+            add("critico" if perda >= 2 else "alerta", f"Perda de pacotes: {_fmt(perda)}%",
+                "A rede de casa está limpa e a perda aparece depois do roteador: indício de problema no provedor.")
+    else:
+        add("bom", "Sem perda de pacotes", "Todos os pacotes de teste foram e voltaram.")
+
+    if s["jitter_ms"] is not None:
+        j = s["jitter_ms"]
+        if j > 30:
+            add("serio", f"Jitter alto: {_fmt(j)} ms", "Chamadas de vídeo e jogos vão travar. Comum em Wi-Fi fraco ou rede congestionada.")
+        elif j > 10:
+            add("alerta", f"Jitter moderado: {_fmt(j)} ms", "Funciona, mas a conexão oscila. No cabo costuma ficar abaixo de 5 ms.")
+        else:
+            add("bom", f"Jitter baixo: {_fmt(j)} ms", "Latência estável.")
+
+    if s["latencia_ms"] is not None and s["latencia_ms"] > 80:
+        add("serio" if s["latencia_ms"] > 150 else "alerta", f"Latência alta: {_fmt(s['latencia_ms'])} ms",
+            "Resposta lenta até a internet. Compare com outros horários.")
+
+    c = r["conexao"]
+    if c.get("tipo") == "wifi" and (sinal := c.get("wifi_sinal_dbm")) is not None:
+        if sinal < -70:
+            add("serio", f"Sinal Wi-Fi fraco: {sinal} dBm", "Aproxime o computador do roteador ou use cabo.")
+        elif sinal < -60:
+            add("alerta", f"Sinal Wi-Fi aceitável: {sinal} dBm", "Funciona, mas está perto do limite. Abaixo de -70 dBm começam as quedas.")
+        else:
+            add("bom", f"Sinal Wi-Fi bom: {sinal} dBm", "Sinal forte.")
+    if c.get("tipo") == "cabo" and (lk := c.get("cabo_link_mbps")):
+        if lk < 1000:
+            add("alerta", f"Cabo negociou só {lk} Mb/s", "Placa e roteador gigabit deveriam fechar 1000 Mb/s. Cabo danificado ou porta ruim limitam a velocidade.")
+        if (c.get("cabo_duplex") or "").lower() == "half":
+            add("serio", "Cabo em half-duplex", "Sinal clássico de cabo ou conector com defeito.")
+
+    if contratado:
+        for chave, cont, nome in (("download_mbps", contratado[0], "Download"), ("upload_mbps", contratado[1], "Upload")):
+            v = s.get(chave)
+            if v is None or not cont:
+                continue
+            pct = 100 * v / cont
+            if pct < 40:
+                add("critico", f"{nome} a {pct:.0f}% do contratado",
+                    f"{_fmt(v)} de {_fmt(cont)} Mbit/s: abaixo do piso de 40% da velocidade instantânea (referência Anatel). Repita em outros horários e registre.")
+            elif pct < 80:
+                add("alerta", f"{nome} a {pct:.0f}% do contratado",
+                    f"{_fmt(v)} de {_fmt(cont)} Mbit/s. A média do mês deve ficar em pelo menos 80% (referência Anatel).")
+            else:
+                add("bom", f"{nome} a {pct:.0f}% do contratado", f"{_fmt(v)} de {_fmt(cont)} Mbit/s.")
+    ordem = {"critico": 0, "serio": 1, "alerta": 2, "bom": 3}
+    return sorted(d, key=lambda x: ordem[x["nivel"]])
+
+
+# --------------------------------------------------------------------------
+# relatório HTML (gráficos em SVG, sem dependências externas)
+# --------------------------------------------------------------------------
+
+CSS = """
+.viz-root{color-scheme:light;--surface-0:#f4f3f0;--surface-1:#fcfcfb;--border:#e2e0da;
+--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#76756f;--grid:#e8e6e1;
+--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--ref:#52514e;
+--good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;--brand:#0d366b}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;
+--surface-0:#111110;--surface-1:#1a1a19;--border:#2e2e2b;--text-primary:#f0efec;--text-secondary:#c3c2b7;
+--text-muted:#9a998f;--grid:#2c2c29;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--ref:#c3c2b7;--brand:#86b6ef}}
+:root[data-theme="dark"] .viz-root{color-scheme:dark;--surface-0:#111110;--surface-1:#1a1a19;--border:#2e2e2b;
+--text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#9a998f;--grid:#2c2c29;--series-1:#3987e5;
+--series-2:#d95926;--series-3:#199e70;--ref:#c3c2b7;--brand:#86b6ef}
+*{box-sizing:border-box}body{margin:0}
+.viz-root{background:var(--surface-0);color:var(--text-primary);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100vh}
+.wrap{max-width:980px;margin:0 auto;padding:28px 20px 48px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;border-bottom:2px solid var(--brand);padding-bottom:14px;margin-bottom:22px}
+.marca{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-secondary);font-weight:600}
+h1{margin:2px 0 0;font-size:30px;letter-spacing:-.01em}h1 span{color:var(--brand)}
+.meta{font-size:13px;color:var(--text-secondary);text-align:right}
+h2{font-size:17px;margin:30px 0 4px}.sub{color:var(--text-secondary);font-size:13px;margin:0 0 12px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(138px,1fr));gap:12px}
+.tile{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.tile .rot{font-size:12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em}
+.tile .val{font-size:28px;font-weight:650;font-variant-numeric:tabular-nums;margin-top:2px}
+.tile .val small{font-size:14px;font-weight:500;color:var(--text-secondary);margin-left:3px}
+.tile .delta{font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:16px 16px 8px}
+.diag{display:grid;gap:8px}.d{display:flex;gap:10px;align-items:flex-start;background:var(--surface-1);border:1px solid var(--border);border-left:4px solid var(--c);border-radius:8px;padding:10px 12px}
+.d .ico{font-weight:700;color:var(--c);width:18px;text-align:center}.d b{display:block}.d span{color:var(--text-secondary);font-size:14px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--text-secondary);margin:0 0 6px}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:6px}
+svg text{font:12px system-ui,sans-serif;fill:var(--text-secondary)}svg .lbl{fill:var(--text-primary);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--border)}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+th{color:var(--text-secondary);font-weight:600}
+details{margin-top:10px}summary{cursor:pointer;color:var(--text-secondary);font-size:13px}
+#tip{position:fixed;pointer-events:none;background:var(--text-primary);color:var(--surface-1);font-size:12px;padding:5px 8px;border-radius:6px;opacity:0;transition:opacity .1s;white-space:nowrap;z-index:9}
+footer{margin-top:36px;font-size:12px;color:var(--text-muted);border-top:1px solid var(--border);padding-top:12px}
+footer a{color:var(--text-secondary)}
+"""
+
+JS = """
+const tip=document.getElementById('tip');
+document.querySelectorAll('[data-tip]').forEach(el=>{
+ el.addEventListener('mousemove',e=>{tip.textContent=el.dataset.tip;tip.style.opacity=1;
+  tip.style.left=Math.min(e.clientX+12,innerWidth-tip.offsetWidth-8)+'px';tip.style.top=(e.clientY-34)+'px'});
+ el.addEventListener('mouseleave',()=>tip.style.opacity=0);});
+"""
+
+NIVEIS = {"bom": ("good", "✓", "Bom"), "alerta": ("warning", "!", "Atenção"),
+          "serio": ("serious", "!", "Sério"), "critico": ("critical", "✕", "Crítico")}
+
+
+def _teto(v: float) -> float:
+    if v <= 0:
+        return 1
+    e = 10 ** math.floor(math.log10(v))
+    for m in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+        if v <= m * e:
+            return m * e
+    return 10 * e
+
+
+def _fmt(v, casas=1):
+    if v is None:
+        return "—"
+    return f"{v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def svg_linhas(series, xrot, unidade, ref=None, alt=240, larg=900):
+    """series: [(nome, var_css, [valores ou None])]. Um eixo só, uma unidade só."""
+    me, md, mt, mb = 48, 110, 14, 30
+    vals = [v for _, _, vs in series for v in vs if v is not None]
+    if ref:
+        vals.append(ref[0])
+    if not vals:
+        return '<p class="sub">Sem dados para o gráfico.</p>'
+    ymax = _teto(max(vals) * 1.1 / 4) * 4
+    n = max(len(vs) for _, _, vs in series)
+    w, h = larg - me - md, alt - mt - mb
+    X = lambda i: me + (w * i / (n - 1) if n > 1 else w / 2)
+    Y = lambda v: mt + h - h * v / ymax
+    o = [f'<svg viewBox="0 0 {larg} {alt}" width="100%" role="img" aria-label="Gráfico em {unidade}">']
+    for k in range(5):
+        v = ymax * k / 4
+        o.append(f'<line x1="{me}" x2="{me + w}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="var(--grid)" stroke-width="1"/>'
+                 f'<text x="{me - 8}" y="{Y(v) + 4:.1f}" text-anchor="end">{_fmt(v, 0 if ymax >= 8 else 1)}</text>')
+    o.append(f'<text x="{me}" y="{mt - 2}" font-size="11">{html.escape(unidade)}</text>')
+    passo = max(1, math.ceil(n / 8))
+    for i in range(0, n, passo):
+        if i < len(xrot):
+            anc = "start" if (i == 0 and n > 1) else ("end" if (i == n - 1 and n > 1) else "middle")
+            o.append(f'<text x="{X(i):.1f}" y="{alt - 8}" text-anchor="{anc}">{html.escape(xrot[i])}</text>')
+    if ref:
+        o.append(f'<line x1="{me}" x2="{me + w}" y1="{Y(ref[0]):.1f}" y2="{Y(ref[0]):.1f}" stroke="var(--ref)" stroke-width="1.5" stroke-dasharray="5 4"/>'
+                 f'<text x="{me + w + 6}" y="{Y(ref[0]) + 4:.1f}">{html.escape(ref[1])}</text>')
+    rotulos = []
+    for nome, cor, vs in series:
+        seg, segs = [], []
+        for i, v in enumerate(vs):
+            if v is None:
+                if seg:
+                    segs.append(seg)
+                seg = []
+            else:
+                seg.append((X(i), Y(v)))
+        if seg:
+            segs.append(seg)
+        for s in segs:
+            pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in s)
+            o.append(f'<polyline points="{pts}" fill="none" stroke="var({cor})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>')
+        mostrar_pontos = n <= 40
+        for i, v in enumerate(vs):
+            if v is None:
+                continue
+            dica = html.escape(f"{nome} · {xrot[i] if i < len(xrot) else i + 1}: {_fmt(v)} {unidade}")
+            if mostrar_pontos:
+                o.append(f'<circle cx="{X(i):.1f}" cy="{Y(v):.1f}" r="4" fill="var({cor})" stroke="var(--surface-1)" stroke-width="2"/>')
+            o.append(f'<circle cx="{X(i):.1f}" cy="{Y(v):.1f}" r="11" fill="transparent" data-tip="{dica}"/>')
+        ult = [(i, v) for i, v in enumerate(vs) if v is not None]
+        if ult and len(series) <= 4:
+            i, v = ult[-1]
+            rotulos.append([Y(v) + 4, X(i) + 10, f"{nome} {_fmt(v)}"])
+    # rótulos diretos no fim das linhas, afastados para não se sobreporem
+    rotulos.sort()
+    for k in range(1, len(rotulos)):
+        if rotulos[k][0] - rotulos[k - 1][0] < 15:
+            rotulos[k][0] = rotulos[k - 1][0] + 15
+    for y, x, t in rotulos:
+        o.append(f'<text class="lbl" x="{x:.1f}" y="{y:.1f}">{html.escape(t)}</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def svg_barras(grupos, series, unidade, refs=(), alt=250, larg=900):
+    """Barras agrupadas: grupos = rótulos do eixo x; series = [(nome, var_css, valores)]."""
+    me, md, mt, mb = 48, 110, 14, 30
+    vals = [v for _, _, vs in series for v in vs if v is not None] + [r[0] for r in refs]
+    if not vals:
+        return '<p class="sub">Sem medições de velocidade ainda. Rode sem --rapido.</p>'
+    ymax = _teto(max(vals) * 1.1 / 4) * 4
+    w, h = larg - me - md, alt - mt - mb
+    g = len(grupos)
+    larg_g = w / max(g, 1)
+    bw = min(28, (larg_g - 10) / len(series) - 2)
+    Y = lambda v: mt + h - h * v / ymax
+    o = [f'<svg viewBox="0 0 {larg} {alt}" width="100%" role="img" aria-label="Gráfico em {unidade}">']
+    for k in range(5):
+        v = ymax * k / 4
+        o.append(f'<line x1="{me}" x2="{me + w}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="var(--grid)"/>'
+                 f'<text x="{me - 8}" y="{Y(v) + 4:.1f}" text-anchor="end">{_fmt(v, 0 if ymax >= 8 else 1)}</text>')
+    o.append(f'<text x="{me}" y="{mt - 2}" font-size="11">{html.escape(unidade)}</text>')
+    passo = max(1, math.ceil(g / 8))
+    for gi, rot in enumerate(grupos):
+        cx = me + larg_g * gi + larg_g / 2
+        if gi % passo == 0:
+            o.append(f'<text x="{cx:.1f}" y="{alt - 8}" text-anchor="middle">{html.escape(rot)}</text>')
+        x0 = cx - (len(series) * (bw + 2) - 2) / 2
+        for si, (nome, cor, vs) in enumerate(series):
+            v = vs[gi] if gi < len(vs) else None
+            if v is None:
+                continue
+            x, y = x0 + si * (bw + 2), Y(v)
+            hh = mt + h - y
+            r = min(4, bw / 2, hh)
+            # topo arredondado, base reta apoiada no eixo
+            p = (f"M{x:.1f},{mt + h:.1f} V{y + r:.1f} Q{x:.1f},{y:.1f} {x + r:.1f},{y:.1f} "
+                 f"H{x + bw - r:.1f} Q{x + bw:.1f},{y:.1f} {x + bw:.1f},{y + r:.1f} V{mt + h:.1f} Z")
+            dica = html.escape(f"{nome} · {rot}: {_fmt(v)} {unidade}")
+            o.append(f'<path d="{p}" fill="var({cor})" data-tip="{dica}"/>')
+    for v, rot in refs:
+        o.append(f'<line x1="{me}" x2="{me + w}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="var(--ref)" stroke-width="1.5" stroke-dasharray="5 4"/>'
+                 f'<text x="{me + w + 6}" y="{Y(v) + 4:.1f}">{html.escape(rot)}</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _legenda(series):
+    return '<div class="legend">' + "".join(f'<span><i style="background:var({c})"></i>{html.escape(n)}</span>' for n, c in series) + "</div>"
+
+
+def _rot_curto(quando: str, rotulo: str | None) -> str:
+    t = dt.datetime.fromisoformat(quando)
+    base = t.strftime("%d/%m %H:%M")
+    return f"{base} · {rotulo}" if rotulo else base
+
+
+def gerar_html(atual: dict, historico: list[dict], contratado) -> str:
+    s = resumo(atual)
+    hist = [h for h in historico][-30:]
+    ant = historico[-2] if len(historico) >= 2 else None
+    c = atual["conexao"]
+
+    def delta(chave, menor_melhor):
+        if not ant or ant.get(chave) is None or s.get(chave) is None:
+            return "primeiro teste" if not ant else "sem comparação"
+        d = s[chave] - ant[chave]
+        if abs(d) < 0.05:
+            return "igual ao anterior"
+        melhor = (d < 0) if menor_melhor else (d > 0)
+        return f"{'▼' if d < 0 else '▲'} {_fmt(abs(d))} vs anterior ({'melhor' if melhor else 'pior'})"
+
+    tipo_txt = {"wifi": "Wi-Fi", "cabo": "Cabo", "usb": "USB/celular"}.get(c.get("tipo"), "—")
+    extra = ""
+    if c.get("tipo") == "wifi":
+        extra = f"{c.get('wifi_banda', '')} · {c.get('wifi_sinal_dbm', '—')} dBm"
+    elif c.get("cabo_link_mbps"):
+        extra = f"link {c['cabo_link_mbps']} Mb/s · {c.get('cabo_duplex', '')}"
+
+    tiles = [
+        ("Latência", _fmt(s["latencia_ms"]), "ms", delta("latencia_ms", True)),
+        ("Jitter", _fmt(s["jitter_ms"]), "ms", delta("jitter_ms", True)),
+        ("Perda", _fmt(s["perda_pct"]), "%", delta("perda_pct", True)),
+        ("Download", _fmt(s["download_mbps"]), "Mbit/s", delta("download_mbps", False)),
+        ("Upload", _fmt(s["upload_mbps"]), "Mbit/s", delta("upload_mbps", False)),
+        ("Conexão", tipo_txt, "", extra or c.get("interface") or ""),
+    ]
+    tiles_html = "".join(
+        f'<div class="tile"><div class="rot">{r}</div><div class="val">{v}<small>{u}</small></div><div class="delta">{html.escape(dl)}</div></div>'
+        for r, v, u, dl in tiles)
+
+    diag_html = "".join(
+        f'<div class="d" style="--c:var(--{NIVEIS[x["nivel"]][0]})"><div class="ico" aria-hidden="true">{NIVEIS[x["nivel"]][1]}</div>'
+        f'<div><b>{NIVEIS[x["nivel"]][2]}: {html.escape(x["titulo"])}</b><span>{html.escape(x["texto"])}</span></div></div>'
+        for x in atual["diagnostico"])
+
+    # gráfico 1: cada pacote do teste atual
+    cores = ["--series-1", "--series-2", "--series-3"]
+    linhas_teste = []
+    gw = atual["latencia"].get("gateway")
+    if gw and gw.get("amostras"):
+        linhas_teste.append(("Roteador", gw["amostras"]))
+    for nome, p in zip([a for a, _ in ALVOS_INTERNET], atual["latencia"]["internet"]):
+        if p.get("amostras"):
+            linhas_teste.append((nome, p["amostras"]))
+    ser1 = [(n, cores[i], v) for i, (n, v) in enumerate(linhas_teste[:3])]
+    n1 = max((len(v) for _, _, v in ser1), default=0)
+    g1 = svg_linhas(ser1, [str(i + 1) for i in range(n1)], "ms") if ser1 else '<p class="sub">Sem amostras.</p>'
+
+    # gráfico 2: histórico de latência e jitter (mesma unidade, um eixo)
+    xr = [_rot_curto(h["quando"], h.get("rotulo")) for h in hist]
+    ser2 = [("Latência", "--series-1", [h.get("latencia_ms") for h in hist]),
+            ("Jitter", "--series-2", [h.get("jitter_ms") for h in hist])]
+    g2 = svg_linhas(ser2, xr, "ms")
+
+    # gráfico 3: histórico de velocidade
+    ser3 = [("Download", "--series-1", [h.get("download_mbps") for h in hist]),
+            ("Upload", "--series-2", [h.get("upload_mbps") for h in hist])]
+    refs = []
+    if contratado and contratado[0]:
+        refs.append((contratado[0] * 0.4, "40% down"))
+    g3 = svg_barras(xr, ser3, "Mbit/s", refs)
+
+    linhas_tab = "".join(
+        f"<tr><td>{html.escape(_rot_curto(h['quando'], None))}</td><td>{html.escape((h.get('rotulo') or '') + (' (' + h['tipo'] + ')' if h.get('tipo') else ''))}</td>"
+        f"<td>{_fmt(h.get('latencia_ms'))}</td><td>{_fmt(h.get('jitter_ms'))}</td><td>{_fmt(h.get('perda_pct'))}</td>"
+        f"<td>{_fmt(h.get('dns_ms'))}</td><td>{_fmt(h.get('download_mbps'))}</td><td>{_fmt(h.get('upload_mbps'))}</td>"
+        f"<td>{h.get('wifi_sinal_dbm') if h.get('wifi_sinal_dbm') is not None else '—'}</td></tr>"
+        for h in reversed(hist))
+
+    sites = atual.get("sites") or []
+    sites_html = ""
+    if sites:
+        sites_html = "<h2>Sites testados</h2><div class='card'><table><tr><th>Endereço</th><th></th><th>Status</th><th>1º byte (ms)</th><th>Total (ms)</th></tr>" + "".join(
+            f"<tr><td>{html.escape(x['url'])}</td><td></td><td>{x.get('status', html.escape(x.get('erro', '—')))}</td>"
+            f"<td>{x.get('primeiro_byte_ms', '—')}</td><td>{x.get('total_ms', '—')}</td></tr>" for x in sites) + "</table></div>"
+
+    quando = dt.datetime.fromisoformat(atual["quando"]).strftime("%d/%m/%Y às %H:%M")
+    rot = f" · {html.escape(atual['rotulo'])}" if atual.get("rotulo") else ""
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kurumin Pulso · {quando}</title><style>{CSS}</style></head>
+<body><div class="viz-root"><div class="wrap">
+<header><div><div class="marca">Kurumin Tecnologia</div><h1>Kurumin <span>Pulso</span></h1></div>
+<div class="meta">Teste de {quando}{rot}<br>{len(historico)} teste(s) no histórico · v{VERSAO}</div></header>
+
+<div class="tiles">{tiles_html}</div>
+
+<h2>Diagnóstico</h2><p class="sub">O que os números querem dizer, do mais importante para o menos.</p>
+<div class="diag">{diag_html}</div>
+
+<h2>Latência de cada pacote neste teste</h2>
+<p class="sub">Linha reta e baixa é conexão estável. Picos indicam oscilação; buracos na linha são pacotes perdidos.</p>
+<div class="card">{_legenda([(n, c) for n, c, _ in ser1])}{g1}</div>
+
+<h2>Histórico: latência e jitter</h2><p class="sub">Últimos {len(hist)} testes neste computador. Quanto mais baixo, melhor.</p>
+<div class="card">{_legenda([(n, c) for n, c, _ in ser2])}{g2}</div>
+
+<h2>Histórico: velocidade</h2><p class="sub">Download e upload medidos contra a rede do Cloudflare.{' A linha tracejada é 40% do contratado.' if refs else ''}</p>
+<div class="card">{_legenda([(n, c) for n, c, _ in ser3])}{g3}
+<details><summary>Ver todos os testes em tabela</summary>
+<table><tr><th>Quando</th><th>Rótulo</th><th>Latência ms</th><th>Jitter ms</th><th>Perda %</th><th>DNS ms</th><th>Down Mbit/s</th><th>Up Mbit/s</th><th>Sinal dBm</th></tr>{linhas_tab}</table>
+</details></div>
+{sites_html}
+<footer>Medição indicativa feita a partir deste computador; não substitui a medição oficial da Anatel.
+Latência por ICMP (ping) ou, sem ping, pelo tempo de conexão TCP. Velocidade medida em speed.cloudflare.com.
+Nenhum IP é gravado no relatório sem a opção <code>--detalhes</code>.<br>
+Kurumin Pulso é software livre (GPL-3.0-or-later) · <a href="{REPO}">{REPO.replace('https://', '')}</a> · Kurumin Tecnologia · contato@kurumintecnologia.com.br</footer>
+</div></div><div id="tip" role="tooltip"></div><script>{JS}</script></body></html>"""
+
+
+# --------------------------------------------------------------------------
+# terminal
+# --------------------------------------------------------------------------
+
+class Cor:
+    def __init__(self, ativo: bool):
+        self.a = ativo
+
+    def __call__(self, cod, txt):
+        return f"\033[{cod}m{txt}\033[0m" if self.a else str(txt)
+
+
+def imprimir(r: dict, ant: dict | None, cor: Cor):
+    s = resumo(r)
+    c = r["conexao"]
+    print()
+    print(cor("1;34", "  KURUMIN PULSO") + cor("2", f"  v{VERSAO} · Kurumin Tecnologia"))
+    print(cor("2", "  " + "─" * 52))
+    tipo = {"wifi": "Wi-Fi", "cabo": "Cabo", "usb": "USB/celular"}.get(c.get("tipo"), "desconhecida")
+    det = ""
+    if c.get("tipo") == "wifi":
+        det = f"{c.get('wifi_banda', '?')}, sinal {c.get('wifi_sinal_dbm', '?')} dBm, taxa {c.get('wifi_taxa_mbps', '?')} Mb/s"
+    elif c.get("cabo_link_mbps"):
+        det = f"link {c['cabo_link_mbps']} Mb/s {c.get('cabo_duplex', '')}"
+    print(f"  Conexão   {cor('1', tipo)} ({c.get('interface') or '?'}) {cor('2', det)}")
+
+    def linha(nome, v, un, chave, menor_melhor):
+        txt = f"{_fmt(v):>8} {un}"
+        if ant and ant.get(chave) is not None and v is not None:
+            d = v - ant[chave]
+            if abs(d) >= 0.05:
+                melhor = (d < 0) if menor_melhor else (d > 0)
+                txt += "  " + cor("32" if melhor else "31", f"{'▼' if d < 0 else '▲'}{_fmt(abs(d))}")
+        print(f"  {nome:<10}{txt}")
+
+    linha("Latência", s["latencia_ms"], "ms", "latencia_ms", True)
+    linha("Jitter", s["jitter_ms"], "ms", "jitter_ms", True)
+    linha("Perda", s["perda_pct"], "%", "perda_pct", True)
+    linha("DNS", s["dns_ms"], "ms", "dns_ms", True)
+    if r.get("download") is not None:
+        if "erro" in r["download"]:
+            print(f"  {'Download':<10}{cor('31', 'falhou: ' + r['download']['erro'])}")
+        else:
+            linha("Download", s["download_mbps"], "Mbit/s", "download_mbps", False)
+    if r.get("upload") is not None:
+        if "erro" in r["upload"]:
+            print(f"  {'Upload':<10}{cor('31', 'falhou: ' + r['upload']['erro'])}")
+        else:
+            linha("Upload", s["upload_mbps"], "Mbit/s", "upload_mbps", False)
+    gw = r["latencia"].get("gateway")
+    if gw:
+        print(cor("2", f"  Roteador  {_fmt(gw.get('media'))} ms, perda {_fmt(gw.get('perda_pct'))}% ({gw['metodo']})"))
+    print(cor("2", "  " + "─" * 52))
+    mapa = {"bom": ("32", "✓"), "alerta": ("33", "!"), "serio": ("33;1", "!"), "critico": ("31;1", "✕")}
+    for d in r["diagnostico"]:
+        k, ic = mapa[d["nivel"]]
+        print(f"  {cor(k, ic)} {cor('1', d['titulo'])}")
+        print(cor("2", f"    {d['texto']}"))
+    print()
+
+
+# --------------------------------------------------------------------------
+# principal
+# --------------------------------------------------------------------------
+
+def ler_historico(caminho: str) -> list[dict]:
+    hist = []
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if linha:
+                    try:
+                        hist.append(json.loads(linha))
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        pass
+    return hist
+
+
+def parse_contratado(txt: str | None):
+    if not txt:
+        return None
+    m = re.fullmatch(r"\s*([\d.,]+)\s*(?:/\s*([\d.,]+))?\s*", txt)
+    if not m:
+        raise argparse.ArgumentTypeError("use o formato DOWN/UP em Mbit/s, ex.: 300/150")
+    down = float(m.group(1).replace(",", "."))
+    up = float(m.group(2).replace(",", ".")) if m.group(2) else None
+    return (down, up)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="kurumin-pulso",
+        description="Kurumin Pulso: teste de rede em um comando, com relatório e histórico. Software livre (GPL-3.0).")
+    ap.add_argument("--rotulo", help="nome curto para este teste (ex.: cabo, wifi, 4g, escritorio)")
+    ap.add_argument("--contratado", type=parse_contratado, help="velocidade do plano em Mbit/s, DOWN/UP (ex.: 300/150)")
+    ap.add_argument("--rapido", action="store_true", help="pula o teste de velocidade (só latência, perda e DNS)")
+    ap.add_argument("--pacotes", type=int, default=30, help="pacotes por destino (padrão: 30)")
+    ap.add_argument("--mb-down", type=int, default=25, help="tamanho do download em MB (padrão: 25)")
+    ap.add_argument("--mb-up", type=int, default=10, help="tamanho do upload em MB (padrão: 10)")
+    ap.add_argument("--site", action="append", default=[], metavar="URL", help="mede o tempo de resposta de um site (pode repetir)")
+    ap.add_argument("--saida", help="pasta dos relatórios (padrão: ~/.local/share/kurumin-pulso/relatorios)")
+    ap.add_argument("--detalhes", action="store_true", help="grava IPs do roteador no histórico e no relatório")
+    ap.add_argument("--json", action="store_true", help="imprime o resultado em JSON (para scripts e painéis)")
+    ap.add_argument("--sem-html", action="store_true", help="não gera o relatório HTML")
+    ap.add_argument("--version", action="version", version=f"kurumin-pulso {VERSAO}")
+    a = ap.parse_args(argv)
+
+    cor = Cor(sys.stdout.isatty() and not a.json and os.environ.get("NO_COLOR") is None)
+    log = (lambda m: None) if a.json else (lambda m: print(cor("2", f"  · {m}"), flush=True))
+
+    agora = dt.datetime.now().astimezone().replace(microsecond=0)
+    r: dict = {"versao": VERSAO, "quando": agora.isoformat(), "rotulo": a.rotulo}
+
+    log("identificando a conexão")
+    r["conexao"] = conexao(a.detalhes)
+    gw_ip = r["conexao"].pop("_gateway", None)
+
+    r["latencia"] = {"gateway": None, "internet": []}
+    if gw_ip:
+        log("medindo até o roteador")
+        r["latencia"]["gateway"] = medir_latencia(gw_ip, a.pacotes, porta_tcp=53)
+    for nome, ip in ALVOS_INTERNET:
+        log(f"medindo até {nome}")
+        p = medir_latencia(ip, a.pacotes)
+        p["destino"] = nome
+        r["latencia"]["internet"].append(p)
+
+    log("medindo DNS")
+    r["dns"] = medir_dns()
+
+    if not a.rapido:
+        log(f"baixando {a.mb_down} MB")
+        r["download"] = medir_download(a.mb_down)
+        log(f"enviando {a.mb_up} MB")
+        r["upload"] = medir_upload(a.mb_up)
+    r["sites"] = [medir_site(u) for u in a.site]
+    r["diagnostico"] = diagnosticar(r, a.contratado)
+
+    dados = pasta_dados()
+    arq_hist = os.path.join(dados, "historico.jsonl")
+    hist = ler_historico(arq_hist)
+    ant = hist[-1] if hist else None
+    s = resumo(r)
+    with open(arq_hist, "a", encoding="utf-8") as f:
+        f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    hist.append(s)
+    with open(os.path.join(dados, "ultimo.json"), "w", encoding="utf-8") as f:
+        json.dump(r, f, ensure_ascii=False, indent=2)
+
+    caminho_html = None
+    if not a.sem_html:
+        pasta = a.saida or os.path.join(dados, "relatorios")
+        os.makedirs(pasta, exist_ok=True)
+        caminho_html = os.path.join(pasta, f"pulso-{agora.strftime('%Y%m%d-%H%M%S')}.html")
+        conteudo = gerar_html(r, hist, a.contratado)
+        with open(caminho_html, "w", encoding="utf-8") as f:
+            f.write(conteudo)
+        with open(os.path.join(pasta, "ultimo.html"), "w", encoding="utf-8") as f:
+            f.write(conteudo)
+
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+    else:
+        imprimir(r, ant, cor)
+        if caminho_html:
+            print(f"  Relatório: {cor('4', 'file://' + caminho_html)}")
+        print(cor("2", f"  Histórico: {arq_hist} ({len(hist)} teste(s))"))
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n  interrompido.")
+        sys.exit(130)
