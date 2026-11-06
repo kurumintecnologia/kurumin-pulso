@@ -25,6 +25,7 @@ import html
 import json
 import math
 import os
+import pathlib
 import re
 import shutil
 import socket
@@ -34,8 +35,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 
-VERSAO = "0.1.0"
+VERSAO = "0.2.0"
+WINDOWS = os.name == "nt"
 REPO = "https://github.com/kurumintecnologia/kurumin-pulso"
 UA = f"KuruminPulso/{VERSAO} (+{REPO})"
 URL_DOWN = "https://speed.cloudflare.com/__down?bytes={n}"
@@ -70,7 +73,10 @@ def ler(caminho: str) -> str | None:
 
 
 def pasta_dados() -> str:
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    if WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     p = os.path.join(base, "kurumin-pulso")
     os.makedirs(p, exist_ok=True)
     return p
@@ -84,8 +90,68 @@ def arred(v, casas=1):
 # medições
 # --------------------------------------------------------------------------
 
+PS_CONEXAO = (
+    "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
+    "Sort-Object RouteMetric | Select-Object -First 1; "
+    "if ($r) { $a = Get-NetAdapter -InterfaceIndex $r.ifIndex; "
+    "[pscustomobject]@{gw=$r.NextHop; nome=$a.Name; midia=[string]$a.PhysicalMediaType; vel=[string]$a.LinkSpeed} "
+    "| ConvertTo-Json -Compress }"
+)
+
+
+def _velocidade_mbps(txt: str) -> int | None:
+    """Converte '1 Gbps', '100 Mbps', '866,7 Mbps' em Mbit/s."""
+    m = re.search(r"([\d.,]+)\s*([GMK])bps", txt or "", re.I)
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", "."))
+    return int(v * {"G": 1000, "M": 1, "K": 0.001}[m.group(2).upper()])
+
+
+def _ler_netsh_wlan(saida: str) -> dict:
+    """Lê 'netsh wlan show interfaces' (em português ou inglês)."""
+    info = {}
+    if (m := re.search(r"^\s*(?:Signal|Sinal)\s*:\s*(\d+)\s*%", saida, re.M | re.I)):
+        pct = int(m.group(1))
+        info["wifi_sinal_pct"] = pct
+        info["wifi_sinal_dbm"] = round(pct / 2 - 100)  # conversão aproximada usada pelo próprio Windows
+    if (m := re.search(r"^\s*(?:Channel|Canal)\s*:\s*(\d+)", saida, re.M | re.I)):
+        canal = int(m.group(1))
+        info["wifi_banda"] = "2,4 GHz" if canal <= 14 else "5 GHz"
+    if (m := re.search(r"^\s*(?:Transmit rate|Taxa de transmiss\S*)\s*\(Mbps\)\s*:\s*([\d.,]+)", saida, re.M | re.I)):
+        info["wifi_taxa_mbps"] = float(m.group(1).replace(",", "."))
+    return info
+
+
+def conexao_windows(detalhes: bool) -> dict:
+    info: dict = {"interface": None, "tipo": "desconhecido"}
+    saida = executar(["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_CONEXAO], timeout=30)
+    m = re.search(r"\{.*\}", saida, re.S)
+    if not m:
+        return info
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return info
+    info["interface"] = d.get("nome")
+    info["_gateway"] = d.get("gw")
+    if detalhes:
+        info["gateway"] = d.get("gw")
+    midia = (d.get("midia") or "").lower()
+    if "802.11" in midia or "wireless" in midia:
+        info["tipo"] = "wifi"
+        info.update(_ler_netsh_wlan(executar(["netsh", "wlan", "show", "interfaces"], timeout=15)))
+    elif "802.3" in midia:
+        info["tipo"] = "cabo"
+        if (v := _velocidade_mbps(d.get("vel"))):
+            info["cabo_link_mbps"] = v
+    return info
+
+
 def conexao(detalhes: bool) -> dict:
     """Descobre por onde o computador sai para a internet (cabo, Wi-Fi, USB)."""
+    if WINDOWS:
+        return conexao_windows(detalhes)
     info: dict = {"interface": None, "tipo": "desconhecido"}
     rota = executar(["ip", "route", "show", "default"])
     m = re.search(r"default via (\S+) dev (\S+)", rota)
@@ -149,12 +215,17 @@ def _resumo_amostras(amostras: list[float], enviados: int, recebidos: int, metod
 
 def medir_latencia(host: str, n: int, porta_tcp: int = 443) -> dict:
     """Usa o ping (ICMP). Sem ping disponível, mede o tempo de conexão TCP."""
-    if shutil.which("ping"):
+    if shutil.which("ping") and not WINDOWS:
         saida = executar(["ping", "-n", "-c", str(n), "-i", "0.2", "-W", "2", host], timeout=n * 0.3 + 15)
         if (m := re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", saida)):
             amostras = [float(x) for x in re.findall(r"time[=<]([\d.]+)", saida)]
             return _resumo_amostras(amostras, int(m.group(1)), int(m.group(2)), "icmp")
     amostras = []
+    if porta_tcp == 53:  # roteador: se não aceitar DNS por TCP, tenta a página de administração
+        try:
+            socket.create_connection((host, 53), timeout=2).close()
+        except OSError:
+            porta_tcp = 80
     for _ in range(n):
         t0 = time.perf_counter()
         try:
@@ -736,11 +807,21 @@ def main(argv=None) -> int:
     ap.add_argument("--detalhes", action="store_true", help="grava IPs do roteador no histórico e no relatório")
     ap.add_argument("--json", action="store_true", help="imprime o resultado em JSON (para scripts e painéis)")
     ap.add_argument("--sem-html", action="store_true", help="não gera o relatório HTML")
+    ap.add_argument("--abrir", action="store_true", help="abre o relatório no navegador ao terminar")
     ap.add_argument("--version", action="version", version=f"kurumin-pulso {VERSAO}")
     a = ap.parse_args(argv)
     # no Debian, o iw fica em /usr/sbin, fora do PATH de usuário comum
-    os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
+    if not WINDOWS:
+        os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
 
+    if WINDOWS:
+        os.system("")  # liga as cores ANSI no terminal do Windows 10/11
+        for fluxo in (sys.stdout, sys.stderr):
+            try:
+                fluxo.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
+    clique_duplo = WINDOWS and getattr(sys, "frozen", False) and argv is None and len(sys.argv) == 1
     cor = Cor(sys.stdout.isatty() and not a.json and os.environ.get("NO_COLOR") is None)
     log = (lambda m: None) if a.json else (lambda m: print(cor("2", f"  · {m}"), flush=True))
 
@@ -799,9 +880,13 @@ def main(argv=None) -> int:
     else:
         imprimir(r, ant, cor)
         if caminho_html:
-            print(f"  Relatório: {cor('4', 'file://' + caminho_html)}")
+            print(f"  Relatório: {cor('4', pathlib.Path(caminho_html).as_uri())}")
         print(cor("2", f"  Histórico: {arq_hist} ({len(hist)} teste(s))"))
         print()
+    if caminho_html and (a.abrir or clique_duplo):
+        webbrowser.open(pathlib.Path(caminho_html).as_uri())
+    if clique_duplo:  # aberto com dois cliques: segura a janela para a pessoa ler
+        input("  Pressione Enter para fechar...")
     return 0
 
 

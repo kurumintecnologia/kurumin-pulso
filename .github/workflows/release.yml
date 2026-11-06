@@ -1,0 +1,72 @@
+# Gera o executável do Windows e o pacote .deb a cada versão (tag v*)
+# e anexa os arquivos na release do GitHub, com as somas SHA-256.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Gerar kurumin-pulso.exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          Copy-Item kurumin-pulso kurumin_pulso.py
+          pyinstaller --onefile --console --name kurumin-pulso kurumin_pulso.py
+      - name: Testar o executável
+        shell: pwsh
+        run: |
+          .\dist\kurumin-pulso.exe --version
+          .\dist\kurumin-pulso.exe --rapido --pacotes 3 --sem-html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/kurumin-pulso.exe
+
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gerar o pacote .deb
+        run: bash packaging/build-deb.sh
+      - name: Testar a instalação
+        run: |
+          sudo apt-get install -y ./dist/kurumin-pulso_*_all.deb
+          kurumin-pulso --version
+          kurumin-pulso --rapido --pacotes 3 --sem-html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+
+  publicar:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Anexar na release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp kurumin-pulso dist/
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "Kurumin Pulso $tag" --generate-notes
+          gh release upload "$tag" dist/* --clobber

@@ -4,13 +4,25 @@
 
 O Kurumin Pulso mede a saúde da sua conexão a partir do próprio computador: latência, jitter, perda de pacotes, DNS, download e upload. Ele também diz **onde** está o problema (dentro de casa ou no provedor) e guarda cada teste para você comparar cabo × Wi-Fi, horário × horário, antes × depois de uma troca.
 
-Feito em Python, sem dependências: roda em qualquer Linux com Python 3.9 ou superior.
+Feito em Python, sem dependências. Roda no **Linux** (Debian, Ubuntu, Sururu e derivados) e no **Windows 10/11**.
+
+![Resumo e diagnóstico do relatório](docs/relatorio-resumo.png)
 
 > Software livre, licença **GPL-3.0-or-later**. Desenvolvido pela Kurumin Tecnologia.
 
 ---
 
 ## Instalação
+
+### Debian, Ubuntu e derivados (.deb)
+
+Baixe o `kurumin-pulso_<versão>_all.deb` na [página de releases](https://github.com/kurumintecnologia/kurumin-pulso/releases/latest) e instale:
+
+```bash
+sudo apt install ./kurumin-pulso_*_all.deb
+```
+
+### Qualquer Linux (sem instalar pacote)
 
 ```bash
 mkdir -p ~/.local/bin
@@ -19,6 +31,12 @@ chmod +x ~/.local/bin/kurumin-pulso
 ```
 
 Se `~/.local/bin` não estiver no seu `PATH`, rode com o caminho completo ou adicione a pasta ao `PATH`.
+
+### Windows 10/11
+
+Baixe o [`kurumin-pulso.exe`](https://github.com/kurumintecnologia/kurumin-pulso/releases/latest/download/kurumin-pulso.exe) e dê dois cliques: o teste roda e o relatório abre no navegador. Também funciona pelo terminal (`kurumin-pulso.exe --rotulo wifi`).
+
+> O executável ainda não tem assinatura digital, então o Windows pode mostrar o aviso do SmartScreen. Clique em **Mais informações → Executar assim mesmo**. Confira a integridade do arquivo com o `SHA256SUMS` da release, se quiser.
 
 ## Uso
 
@@ -34,7 +52,7 @@ kurumin-pulso --json                  # saída em JSON, para scripts e painéis
 Ao final, o terminal mostra o resumo e o caminho do relatório:
 
 ```
-  KURUMIN PULSO  v0.1.0 · Kurumin Tecnologia
+  KURUMIN PULSO  v0.2.0 · Kurumin Tecnologia
   ────────────────────────────────────────────────────
   Conexão   Wi-Fi (wlo1) 5 GHz, sinal -64 dBm, taxa 390 Mb/s
   Latência      27,2 ms  ▲3,4
@@ -57,6 +75,7 @@ Ao final, o terminal mostra o resumo e o caminho do relatório:
 | `--saida PASTA` | Onde salvar os relatórios |
 | `--detalhes` | Inclui o IP do roteador no histórico e no relatório |
 | `--json` | Imprime o resultado completo em JSON |
+| `--abrir` | Abre o relatório no navegador ao terminar |
 | `--sem-html` | Não gera o relatório |
 
 ## O que ele mede
@@ -71,7 +90,7 @@ Ao final, o terminal mostra o resumo e o caminho do relatório:
 | **Download / upload** | transferência real contra `speed.cloudflare.com` | Velocidade entregue no momento do teste |
 | **Conexão** | cabo, Wi-Fi ou USB; sinal e banda do Wi-Fi; velocidade negociada do cabo | Um cabo que fecha só 100 Mb/s ou em *half-duplex* geralmente está danificado |
 
-Sem o comando `ping` disponível, o Pulso mede a latência pelo tempo de conexão TCP e informa isso no relatório.
+Sem o comando `ping` disponível, e sempre no Windows, o Pulso mede a latência pelo tempo de conexão TCP e informa isso no relatório. No Windows, o sinal do Wi-Fi vem em porcentagem e é convertido para dBm de forma aproximada.
 
 ## O relatório
 
@@ -86,6 +105,10 @@ Cada teste gera uma página HTML independente (abre em qualquer navegador, sem i
 
 Tema claro e escuro automáticos.
 
+![Latência de cada pacote: roteador, Cloudflare e Google](docs/relatorio-latencia.png)
+
+![Histórico de latência e jitter](docs/relatorio-historico.png)
+
 ## Referência de velocidade
 
 Com `--contratado`, o Pulso compara a velocidade medida com a referência da Anatel para banda larga: **velocidade instantânea de pelo menos 40% do contratado** e **média mensal de pelo menos 80%**.
@@ -96,7 +119,7 @@ Com `--contratado`, o Pulso compara a velocidade medida com a referência da Ana
 
 - Nenhum dado sai do seu computador, exceto o tráfego dos próprios testes (ping, DNS e transferência com o Cloudflare).
 - O relatório e o histórico **não gravam IPs** a menos que você use `--detalhes`.
-- Arquivos ficam em `~/.local/share/kurumin-pulso/`:
+- Arquivos ficam em `~/.local/share/kurumin-pulso/` (no Windows, em `%LOCALAPPDATA%\kurumin-pulso\`):
   - `historico.jsonl`: uma linha por teste, com os números-chave;
   - `ultimo.json`: o resultado completo do último teste;
   - `relatorios/`: as páginas HTML.
@@ -116,7 +139,9 @@ Issues e pull requests são bem-vindos. Ideias para as próximas versões:
 - medição de latência sob carga (*bufferbloat*);
 - testes IPv6;
 - exportação em CSV;
-- empacotamento `.deb`.
+- inclusão no repositório oficial do Debian.
+
+Para gerar o `.deb` localmente: `bash packaging/build-deb.sh`.
 
 ## Licença
 
